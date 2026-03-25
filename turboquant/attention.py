@@ -1,10 +1,10 @@
-"""TurboQuant Optimierte Attention — MLX-nativ, voll vektorisiert.
+"""TurboQuant optimized attention — MLX-native, fully vectorized.
 
-Optimierungen vs. Basisversion:
-  1. Kombiniertes Rotation+JL-Sketch in einem Matmul (1 Dispatch statt 2)
-  2. Value-Assoziativität: (weights @ centroids) @ Pi statt weights @ (centroids @ Pi)
-     → spart O(T_kv × D²) pro Token, reduziert auf O(T_q × D²)
-  3. Kein Python-Loop, volle MLX-Graph-Optimierung
+Optimizations vs. base version:
+  1. Combined rotation+JL sketch in one matmul (1 dispatch instead of 2)
+  2. Value associativity: (weights @ centroids) @ Pi instead of weights @ (centroids @ Pi)
+     -> saves O(T_kv x D^2) per token, reduced to O(T_q x D^2)
+  3. No Python loop, full MLX graph optimization
 """
 
 import math
@@ -12,17 +12,7 @@ import math
 import mlx.core as mx
 
 from turboquant.kernels import unpack_2bit_indices
-
-# Bit-Indizes für Sign-Bit Entpackung (einmal alloziert)
-_BITS_32 = mx.arange(32, dtype=mx.uint32)
-
-
-def _unpack_sign_bits(sign_bits: mx.array) -> mx.array:
-    """Entpackt uint32 Sign-Bits zu ±1.0 float32."""
-    expanded = (sign_bits[..., None] >> _BITS_32) & 1
-    flat_D = sign_bits.shape[-1] * 32
-    result = expanded.reshape(*sign_bits.shape[:-1], flat_D)
-    return 2.0 * result.astype(mx.float32) - 1.0
+from turboquant.qjl import unpack_sign_bits
 
 
 def turboquant_scaled_dot_product_attention(
@@ -31,13 +21,13 @@ def turboquant_scaled_dot_product_attention(
     scale: float,
     mask=None,
 ) -> mx.array:
-    """Optimierte TurboQuant Attention.
+    """Optimized TurboQuant attention.
 
     Args:
         queries: (B, n_q_heads, T_q, D)
         cache: TurboQuantKVCache
-        scale: Typisch 1/sqrt(D)
-        mask: "causal", bool-array, oder None
+        scale: Typically 1/sqrt(D)
+        mask: "causal", bool array, or None
 
     Returns:
         output: (B, n_q_heads, T_q, D)
@@ -47,7 +37,7 @@ def turboquant_scaled_dot_product_attention(
     n_repeats = n_q_heads // n_kv_heads
     T_kv = cache.offset
 
-    # --- 1. Rotation (+ JL-Sketch wenn QJL aktiv) ---
+    # --- 1. Rotation (+ JL sketch when QJL active) ---
     q_scaled = queries * scale
     if cache.use_qjl:
         q_combined = q_scaled @ cache.combined_rot_jl.T  # (B, n_q_heads, T_q, 2D)
@@ -69,7 +59,7 @@ def turboquant_scaled_dot_product_attention(
     # --- 3. QJL-Score (optional) ---
     if cache.use_qjl:
         q_sketch_grouped = q_sketch.reshape(B, n_kv_heads, n_repeats, T_q, D)
-        k_signs_float = _unpack_sign_bits(cache.key_sign_bits[:, :, :T_kv, :])
+        k_signs_float = unpack_sign_bits(cache.key_sign_bits[:, :, :T_kv, :])
         k_signs_expanded = k_signs_float[:, :, None, :, :]
 
         qjl_scores = q_sketch_grouped @ k_signs_expanded.transpose(0, 1, 2, 4, 3)
@@ -93,21 +83,19 @@ def turboquant_scaled_dot_product_attention(
     # --- 6. Softmax ---
     weights = mx.softmax(scores, axis=-1, precise=True)
 
-    # --- 7. Value Output via Matrix-Assoziativität ---
-    # Alt: output = weights @ (centroid_values @ Pi * norms)  →  O(T_kv × D²) Decode
-    # Neu: output = ((weights * norms) @ centroid_values) @ Pi  →  O(T_q × D²) Rotate
+    # --- 7. Value output via matrix associativity ---
     value_indices = cache.get_value_indices()[:, :, :T_kv, :]
     value_centroids = cache.centroids[value_indices]  # (B, n_kv_heads, T_kv, D)
 
-    # Norms in Weights einrechnen: (B, kv, reps, T_q, T_kv) * (B, kv, 1, 1, T_kv)
+    # Fold norms into weights: (B, kv, reps, T_q, T_kv) * (B, kv, 1, 1, T_kv)
     value_norms = cache.value_norms[:, :, :T_kv]
     weighted_norms = weights * value_norms[:, :, None, None, :]
 
-    # Gewichtete Centroid-Summe: (B, kv, reps, T_q, T_kv) @ (B, kv, 1, T_kv, D)
+    # Weighted centroid sum: (B, kv, reps, T_q, T_kv) @ (B, kv, 1, T_kv, D)
     value_centroids_expanded = value_centroids[:, :, None, :, :]
     weighted_centroids = weighted_norms @ value_centroids_expanded  # (B, kv, reps, T_q, D)
 
-    # Einmal inverse Rotation: (B, kv, reps, T_q, D) @ (D, D)
+    # Single inverse rotation: (B, kv, reps, T_q, D) @ (D, D)
     output = weighted_centroids @ cache.rotation_matrix  # Pi^T @ c = c @ Pi
     output = output.reshape(B, n_q_heads, T_q, D)
 

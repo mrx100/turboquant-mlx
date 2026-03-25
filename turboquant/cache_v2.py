@@ -1,29 +1,36 @@
-"""TurboQuantKVCache V2 — PolarQuant-Rotation + MLX-native Quantisierung.
+"""TurboQuantKVCache V2 — Random rotation + MLX-native quantization.
 
-Nutzt PolarQuant's Rotation für gleichmäßige Verteilung, dann MLX's
-eingebaute affine Quantisierung (mx.quantize) + optimierten quantized_matmul
-Metal Kernel für maximale Hardware-Nähe.
+Uses TurboQuant's random QR rotation for uniform distribution, then MLX's
+built-in affine quantization (mx.quantize) + optimized quantized_matmul
+Metal kernel for maximum hardware affinity.
 
-Pre-Allokation mit step=256 wie MLX's QuantizedKVCache für minimalen
-Allokations-Overhead.
+Pre-allocation with step=256 like MLX's QuantizedKVCache for minimal
+allocation overhead.
 """
+
+import math
 
 import mlx.core as mx
 from mlx.utils import tree_map
 
-from turboquant.rotation import generate_rotation_matrix, generate_jl_matrix
-from turboquant.kernels import pack_sign_bits, qjl_encode
+from turboquant.cache import make_causal_mask
+from turboquant.rotation import (
+    generate_rotation_matrix,
+    generate_jl_matrix,
+    build_combined_rot_jl,
+    safe_normalize,
+)
+from turboquant.qjl import qjl_encode
 
 
 class TurboQuantKVCacheV2:
-    """TurboQuant V2 — PolarQuant Rotation + MLX native quantized_matmul.
+    """TurboQuant V2 — Random QR rotation + MLX native quantized_matmul.
 
-    Speichert Keys/Values als MLX-quantisierte Tensoren im rotierten Raum.
-    Scoring nutzt mx.quantized_matmul für maximale Performance.
-    Pre-Allokation mit step=256 für O(T/256) statt O(T) Reallokationen.
+    Stores keys/values as MLX-quantized tensors in rotated space.
+    Scoring uses mx.quantized_matmul for maximum performance.
+    Pre-allocation with step=256 for O(T/256) instead of O(T) reallocations.
     """
 
-    is_turboquant_v2 = True
     step = 256
 
     def __init__(
@@ -43,7 +50,7 @@ class TurboQuantKVCacheV2:
         self.use_rotation = use_rotation
         self.use_normalization = use_normalization
         self.offset = 0
-        self._el_per_int = 8 * mx.uint32.size // bits
+        self._el_per_int = 32 // bits  # for reference only
 
         if use_rotation:
             self.rotation_matrix = generate_rotation_matrix(head_dim, seed=seed)
@@ -54,10 +61,10 @@ class TurboQuantKVCacheV2:
         if use_qjl:
             self.jl_matrix = generate_jl_matrix(head_dim, seed=seed + 95)
             mx.eval(self.jl_matrix)
-            self.combined_rot_jl = mx.concatenate(
-                [self.rotation_matrix, self.jl_matrix @ self.rotation_matrix], axis=0
-            )
-            mx.eval(self.combined_rot_jl)
+            self.combined_rot_jl = build_combined_rot_jl(self.rotation_matrix, self.jl_matrix)
+            self.qjl_scale = math.sqrt(math.pi / 2.0) / head_dim
+            self.qjl_scale_arr = mx.array([self.qjl_scale], dtype=mx.float32)
+            mx.eval(self.qjl_scale_arr)
 
         self.keys = None
         self.values = None
@@ -65,9 +72,10 @@ class TurboQuantKVCacheV2:
         self.value_norms = None
         self.key_sign_bits = None
         self.key_residual_norms = None
+        self._n_proj_words = None  # sign_bits last dim, set on first QJL encode
 
     def _ensure_capacity(self, B, n_kv_heads, num_steps, k_head_dim, v_head_dim, dtype):
-        """Pre-alloziert oder expandiert Buffer nach MLX-Muster (step=256)."""
+        """Pre-allocates or expands buffer following MLX pattern (step=256)."""
         prev = self.offset
         if self.keys is not None and (prev + num_steps) <= self.keys[0].shape[-2]:
             return
@@ -76,8 +84,10 @@ class TurboQuantKVCacheV2:
         shape = (B, n_kv_heads, new_steps)
 
         def init_quant(dim):
+            # mx.quantize packs data as: dim * bits // 32 uint32 words
+            packed_dim = dim * self.bits // 32
             return (
-                mx.zeros((*shape, dim // self._el_per_int), dtype=mx.uint32),
+                mx.zeros((*shape, packed_dim), dtype=mx.uint32),
                 mx.zeros((*shape, dim // self.group_size), dtype=dtype),
                 mx.zeros((*shape, dim // self.group_size), dtype=dtype),
             )
@@ -101,29 +111,42 @@ class TurboQuantKVCacheV2:
                 vn = self.value_norms if prev % self.step == 0 else self.value_norms[:, :, :prev]
                 self.key_norms = mx.concatenate([kn, k_exp], axis=-1)
                 self.value_norms = mx.concatenate([vn, v_exp], axis=-1)
+            if self.use_qjl and self.key_sign_bits is not None:
+                n_proj_words = self.key_sign_bits.shape[-1]
+                sb_exp = mx.zeros((B, n_kv_heads, new_steps, n_proj_words), dtype=mx.uint32)
+                rn_exp = mx.zeros((B, n_kv_heads, new_steps), dtype=mx.float32)
+                sb_old = self.key_sign_bits if prev % self.step == 0 else self.key_sign_bits[:, :, :prev, :]
+                rn_old = self.key_residual_norms if prev % self.step == 0 else self.key_residual_norms[:, :, :prev]
+                self.key_sign_bits = mx.concatenate([sb_old, sb_exp], axis=2)
+                self.key_residual_norms = mx.concatenate([rn_old, rn_exp], axis=2)
         else:
             self.keys = init_quant(k_head_dim)
             self.values = init_quant(v_head_dim)
             if self.use_normalization:
                 self.key_norms = mx.zeros((B, n_kv_heads, new_steps), dtype=dtype)
                 self.value_norms = mx.zeros((B, n_kv_heads, new_steps), dtype=dtype)
+            if self.use_qjl:
+                n_proj_words = k_head_dim // 32
+                self._n_proj_words = n_proj_words
+                self.key_sign_bits = mx.zeros((B, n_kv_heads, new_steps, n_proj_words), dtype=mx.uint32)
+                self.key_residual_norms = mx.zeros((B, n_kv_heads, new_steps), dtype=mx.float32)
 
     def _normed_quant(self, quant_tuple, norms):
-        """Backt Norms in quantisierte Scales/Biases ein."""
+        """Bakes norms into quantized scales/biases."""
         data, scales, biases = quant_tuple
         T = self.offset
         n = norms[:, :, :T, None]
         return (data[:, :, :T, :], scales[:, :, :T, :] * n, biases[:, :, :T, :] * n)
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
-        """Quantisiert neue KV-Paare und schreibt in pre-allozierten Buffer."""
+        """Quantizes new KV pairs and writes into pre-allocated buffer."""
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
         prev = self.offset
 
         self._ensure_capacity(B, n_kv_heads, num_steps, k_head_dim, v_head_dim, keys.dtype)
 
-        # --- Lean Path: Ohne Normalisierung ---
+        # --- Lean Path: Without normalization ---
         if not self.use_normalization:
             if self.use_rotation:
                 k_to_q = keys @ self.rotation_matrix.T
@@ -145,14 +168,9 @@ class TurboQuantKVCacheV2:
                 tree_map(lambda x: x[..., :self.offset, :], self.values),
             )
 
-        # --- Full Path: Normalisierung + optional Rotation ---
-        k_norms = mx.linalg.norm(keys, axis=-1, keepdims=True)
-        v_norms = mx.linalg.norm(values, axis=-1, keepdims=True)
-        safe_k_norms = mx.where(k_norms < 1e-8, mx.ones_like(k_norms), k_norms)
-        safe_v_norms = mx.where(v_norms < 1e-8, mx.ones_like(v_norms), v_norms)
-
-        k_normalized = keys / safe_k_norms
-        v_normalized = values / safe_v_norms
+        # --- Full Path: Normalization + optional rotation ---
+        k_normalized, k_norms = safe_normalize(keys)
+        v_normalized, v_norms = safe_normalize(values)
 
         if self.use_rotation:
             k_to_q = k_normalized @ self.rotation_matrix.T
@@ -164,7 +182,7 @@ class TurboQuantKVCacheV2:
         k_quant = mx.quantize(k_to_q, group_size=self.group_size, bits=self.bits)
         v_quant = mx.quantize(v_to_q, group_size=self.group_size, bits=self.bits)
 
-        # QJL auf Residual (optional)
+        # QJL on residual (optional)
         if self.use_qjl:
             k_dequant = mx.dequantize(*k_quant, group_size=self.group_size, bits=self.bits)
             k_residual = k_to_q - k_dequant
@@ -179,16 +197,8 @@ class TurboQuantKVCacheV2:
         self.value_norms[:, :, prev:self.offset] = v_norms.squeeze(-1)
 
         if self.use_qjl:
-            if self.key_sign_bits is None:
-                self.key_sign_bits = k_sign_bits
-                self.key_residual_norms = k_residual_norms
-            else:
-                self.key_sign_bits = mx.concatenate(
-                    [self.key_sign_bits, k_sign_bits], axis=2
-                )
-                self.key_residual_norms = mx.concatenate(
-                    [self.key_residual_norms, k_residual_norms], axis=2
-                )
+            self.key_sign_bits[:, :, prev:self.offset, :] = k_sign_bits
+            self.key_residual_norms[:, :, prev:self.offset] = k_residual_norms
 
         return (
             self._normed_quant(self.keys, self.key_norms),
@@ -196,12 +206,7 @@ class TurboQuantKVCacheV2:
         )
 
     def make_mask(self, N, return_array=False, window_size=None, **kwargs):
-        from mlx_lm.models.base import create_causal_mask
-        if N == 1:
-            return None
-        if return_array or (window_size and N > window_size):
-            return create_causal_mask(N, offset=self.offset - N, window_size=window_size)
-        return "causal"
+        return make_causal_mask(self.offset, N, return_array, window_size)
 
     @property
     def state(self):
@@ -212,7 +217,7 @@ class TurboQuantKVCacheV2:
         if self.use_normalization and self.key_norms is not None:
             parts += [self.key_norms[:, :, :self.offset], self.value_norms[:, :, :self.offset]]
         if self.use_qjl and self.key_sign_bits is not None:
-            parts += [self.key_sign_bits, self.key_residual_norms]
+            parts += [self.key_sign_bits[:, :, :self.offset, :], self.key_residual_norms[:, :, :self.offset]]
         return parts
 
     @state.setter
@@ -254,7 +259,8 @@ class TurboQuantKVCacheV2:
             total += T * self.key_norms[:, :, :1].nbytes
             total += T * self.value_norms[:, :, :1].nbytes
         if self.use_qjl and self.key_sign_bits is not None:
-            total += self.key_sign_bits.nbytes + self.key_residual_norms.nbytes
+            total += T * self.key_sign_bits[:, :, :1, :].nbytes
+            total += T * self.key_residual_norms[:, :, :1].nbytes
         return total
 
     @property
