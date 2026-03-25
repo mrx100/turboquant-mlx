@@ -1,0 +1,37 @@
+"""Monkey-Patch für mlx-lm's SDPA Dispatch.
+
+Unterstützt TurboQuant V1 (fused Metal Kernel), V2 (mx.quantized_matmul).
+"""
+
+import mlx.core as mx
+import mlx_lm.models.base as _base
+
+from turboquant.attention_fused import turboquant_fused_sdpa
+from turboquant.attention_v2 import turboquant_v2_sdpa
+
+_original_sdpa = _base.scaled_dot_product_attention
+_patched = False
+
+
+def _patched_sdpa(queries, keys, values, cache, scale, mask, **kwargs):
+    if getattr(cache, "is_turboquant_v2", False):
+        return turboquant_v2_sdpa(queries, keys, values, cache, scale, mask)
+    if getattr(cache, "is_turboquant", False):
+        return turboquant_fused_sdpa(queries, cache, scale, mask)
+    return _original_sdpa(queries, keys, values, cache, scale, mask, **kwargs)
+
+
+def apply():
+    """Aktiviert den TurboQuant SDPA-Patch. Idempotent."""
+    global _patched
+    if _patched:
+        return
+    _base.scaled_dot_product_attention = _patched_sdpa
+    _patched = True
+
+
+def revert():
+    """Entfernt den Patch."""
+    global _patched
+    _base.scaled_dot_product_attention = _original_sdpa
+    _patched = False
