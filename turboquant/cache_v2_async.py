@@ -1,16 +1,17 @@
-"""AsyncTurboQuantKVCacheV2 — Double-buffered pipelined quantization.
+"""AsyncTurboQuantKVCacheV2 — Optimized KV cache with selective async quantization.
 
-Extends TurboQuantKVCacheV2 with asynchronous quantization using MLX streams.
-While the attention mechanism reads from the quantized buffer, the next batch
-of FP16 K/V pairs is being quantized on a separate stream in the background.
+Extends TurboQuantKVCacheV2 with intelligent async/sync switching:
+- Single-token decoding (T=1): Uses sync quantization (lower latency)
+- Batched prefill (T>threshold): Uses async quantization on separate stream
+- Automatic threshold detection based on batch size
 
-Pipeline:
+Pipeline (batched mode):
   Forward Pass → FP16 K/V → [Pending] → async quantize → [Ready] → Attention
        ↓                                                    ↓
     next tokens                                    quantized_matmul (reads)
 
 Memory overhead: +1× FP16 buffer size (~2-3GB for Qwen3.6-35B at full context)
-Expected speedup: 15-25% tok/s improvement due to pipelined quantization
+Expected speedup: 15-25% tok/s improvement during prefill phase
 """
 
 import math
@@ -28,9 +29,15 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
     
     Uses a separate MLX stream for quantization operations, allowing
     the forward pass and quantization to overlap in time.
+    
+    Automatically switches to sync mode for single-token decoding to
+    avoid stream-switching overhead.
     """
     
-    def __init__(self, *args, **kwargs):
+    # Async threshold: minimum tokens per call to benefit from async
+    ASYNC_THRESHOLD = 16
+    
+    def __init__(self, *args, async_threshold=None, **kwargs):
         super().__init__(*args, **kwargs)
         
         # Async state
@@ -51,6 +58,7 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
         self._quant_in_progress = False
         self._async_ops_count = 0
         self._sync_fallback_count = 0
+        self._async_threshold = async_threshold or self.ASYNC_THRESHOLD
         
         # Try to enable async
         try:
@@ -58,6 +66,10 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
             self._async_enabled = True
         except Exception:
             self._async_enabled = False
+    
+    def _should_use_async(self, num_steps):
+        """Determine if async quantization is beneficial for this batch size."""
+        return self._async_enabled and num_steps >= self._async_threshold
     
     def _quantize_async(self, keys, values):
         """Start async quantization on separate stream.
@@ -71,6 +83,23 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
         
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
+        
+        # Check if async is beneficial for this batch size
+        if not self._should_use_async(num_steps):
+            self._sync_fallback_count += 1
+            return self._quantize_sync(keys, values)
+        
+        # First call: must quantize synchronously to initialize buffers
+        if self.keys is None:
+            self._sync_fallback_count += 1
+            result = self._quantize_sync(keys, values)
+            # After sync init, we can use async for next calls
+            return result
+        
+        # Wait for previous async quantization to complete
+        if self._quant_in_progress:
+            mx.synchronize(self._quant_stream)
+            self._commit_async_quantization()
         
         # Store pending FP16 data
         self._pending_keys = keys
@@ -117,9 +146,10 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
             self._quant_in_progress = True
             self._async_ops_count += 1
         
+        # Return already-quantized buffer (from previous iteration)
         return (
-            tree_map(lambda x: x[..., :self.offset, :], self.keys),
-            tree_map(lambda x: x[..., :self.offset, :], self.values),
+            tree_map(lambda x: x[..., :self.offset, :], self.keys) if self.keys is not None else None,
+            tree_map(lambda x: x[..., :self.offset, :], self.values) if self.values is not None else None,
         )
     
     def _quantize_sync(self, keys, values):
@@ -219,23 +249,27 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
         self._pending_v_norms = None
     
     def update_and_fetch(self, keys, values):
-        """Async version: starts quantization in background, returns ready buffer.
+        """Smart update: uses async for batched prefill, sync for single-token decoding.
         
         Pipeline:
-        1. Wait for previous async quantization to complete (if any)
-        2. Start new async quantization for current K/V
-        3. Return already-quantized buffer for attention
+        1. Check batch size against async threshold
+        2. If batched (T >= threshold): async quantization with double-buffering
+        3. If single-token (T < threshold): sync quantization (lower latency)
+        4. Return quantized buffer for attention
         """
-        # Wait for previous async quantization
-        if self._quant_in_progress:
-            self._commit_async_quantization()
+        num_steps = keys.shape[-2]
         
-        # Start new async quantization
-        return self._quantize_async(keys, values)
+        # Use async only for batched operations
+        if self._should_use_async(num_steps):
+            return self._quantize_async(keys, values)
+        else:
+            self._sync_fallback_count += 1
+            return self._quantize_sync(keys, values)
     
     def flush(self):
         """Force completion of any pending async quantization."""
         if self._quant_in_progress:
+            mx.synchronize(self._quant_stream)
             self._commit_async_quantization()
     
     @property
@@ -246,4 +280,5 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
             "async_ops_count": self._async_ops_count,
             "sync_fallback_count": self._sync_fallback_count,
             "quant_in_progress": self._quant_in_progress,
+            "async_threshold": self._async_threshold,
         }
