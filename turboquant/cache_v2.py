@@ -29,6 +29,10 @@ class TurboQuantKVCacheV2:
     Stores keys/values as MLX-quantized tensors in rotated space.
     Scoring uses mx.quantized_matmul for maximum performance.
     Pre-allocation with step=256 for O(T/256) instead of O(T) reallocations.
+
+    Supports asymmetric K/V bit allocation:
+      - Keys (K): More bits for precision (default 4-bit) — softmax is sensitive
+      - Values (V): Fewer bits tolerated (default 2-bit) — weighted sums are robust
     """
 
     step = 256
@@ -42,6 +46,8 @@ class TurboQuantKVCacheV2:
         use_rotation: bool = True,
         use_normalization: bool = True,
         seed: int = 42,
+        k_bits: int = None,
+        v_bits: int = None,
     ):
         self.head_dim = head_dim
         self.bits = bits
@@ -50,7 +56,9 @@ class TurboQuantKVCacheV2:
         self.use_rotation = use_rotation
         self.use_normalization = use_normalization
         self.offset = 0
-        self._el_per_int = 32 // bits  # for reference only
+        self.k_bits = k_bits if k_bits is not None else bits
+        self.v_bits = v_bits if v_bits is not None else bits
+        self._el_per_int = 32 // self.k_bits  # for reference only
 
         if use_rotation:
             self.rotation_matrix = generate_rotation_matrix(head_dim, seed=seed)
@@ -73,9 +81,13 @@ class TurboQuantKVCacheV2:
         self.key_sign_bits = None
         self.key_residual_norms = None
         self._n_proj_words = None  # sign_bits last dim, set on first QJL encode
+        self._extra = {}  # arbitrary tensor storage for linear_attn etc.
 
     def _ensure_capacity(self, B, n_kv_heads, num_steps, k_head_dim, v_head_dim, dtype):
-        """Pre-allocates or expands buffer following MLX pattern (step=256)."""
+        """Pre-allocates or expands buffer following MLX pattern (step=256).
+
+        Supports asymmetric K/V bit allocation for optimized memory/quality tradeoff.
+        """
         prev = self.offset
         if self.keys is not None and (prev + num_steps) <= self.keys[0].shape[-2]:
             return
@@ -83,9 +95,8 @@ class TurboQuantKVCacheV2:
         new_steps = (self.step + num_steps - 1) // self.step * self.step
         shape = (B, n_kv_heads, new_steps)
 
-        def init_quant(dim):
-            # mx.quantize packs data as: dim * bits // 32 uint32 words
-            packed_dim = dim * self.bits // 32
+        def init_quant(dim, bits):
+            packed_dim = dim * bits // 32
             return (
                 mx.zeros((*shape, packed_dim), dtype=mx.uint32),
                 mx.zeros((*shape, dim // self.group_size), dtype=dtype),
@@ -120,8 +131,8 @@ class TurboQuantKVCacheV2:
                 self.key_sign_bits = mx.concatenate([sb_old, sb_exp], axis=2)
                 self.key_residual_norms = mx.concatenate([rn_old, rn_exp], axis=2)
         else:
-            self.keys = init_quant(k_head_dim)
-            self.values = init_quant(v_head_dim)
+            self.keys = init_quant(k_head_dim, self.k_bits)
+            self.values = init_quant(v_head_dim, self.v_bits)
             if self.use_normalization:
                 self.key_norms = mx.zeros((B, n_kv_heads, new_steps), dtype=dtype)
                 self.value_norms = mx.zeros((B, n_kv_heads, new_steps), dtype=dtype)
@@ -155,8 +166,8 @@ class TurboQuantKVCacheV2:
                 k_to_q = keys
                 v_to_q = values
 
-            k_quant = mx.quantize(k_to_q, group_size=self.group_size, bits=self.bits)
-            v_quant = mx.quantize(v_to_q, group_size=self.group_size, bits=self.bits)
+            k_quant = mx.quantize(k_to_q, group_size=self.group_size, bits=self.k_bits)
+            v_quant = mx.quantize(v_to_q, group_size=self.group_size, bits=self.v_bits)
 
             self.offset += num_steps
             for i in range(len(self.keys)):
@@ -179,8 +190,8 @@ class TurboQuantKVCacheV2:
             k_to_q = k_normalized
             v_to_q = v_normalized
 
-        k_quant = mx.quantize(k_to_q, group_size=self.group_size, bits=self.bits)
-        v_quant = mx.quantize(v_to_q, group_size=self.group_size, bits=self.bits)
+        k_quant = mx.quantize(k_to_q, group_size=self.group_size, bits=self.k_bits)
+        v_quant = mx.quantize(v_to_q, group_size=self.group_size, bits=self.v_bits)
 
         # QJL on residual (optional)
         if self.use_qjl:
@@ -240,8 +251,32 @@ class TurboQuantKVCacheV2:
         self.offset -= n
         return n
 
+    def advance(self, n):
+        self.offset += n
+
     def empty(self):
         return self.keys is None
+
+    def __getitem__(self, idx):
+        if idx in self._extra:
+            return self._extra[idx]
+        if self.keys is None:
+            return None
+        return (self.keys[idx], self.values[idx])
+
+    def __setitem__(self, idx, value):
+        self._extra[idx] = value
+
+    def __len__(self):
+        if self.keys is None:
+            return 0
+        return len(self.keys)
+
+    @property
+    def lengths(self):
+        if self.keys is None:
+            return None
+        return mx.array([self.offset])
 
     @property
     def nbytes(self):
@@ -262,6 +297,26 @@ class TurboQuantKVCacheV2:
             total += T * self.key_sign_bits[:, :, :1, :].nbytes
             total += T * self.key_residual_norms[:, :, :1].nbytes
         return total
+
+    def compression_info(self):
+        """Returns dict with K/V bit allocation and compression ratios."""
+        if self.keys is None:
+            return {}
+        B, n_kv_heads = self.keys[0].shape[:2]
+        T = self.offset
+        D = self.head_dim
+        fp16_bytes = B * n_kv_heads * T * D * 2 * 2
+        k_ratio = 16 / self.k_bits if self.k_bits > 0 else 1
+        v_ratio = 16 / self.v_bits if self.v_bits > 0 else 1
+        return {
+            "k_bits": self.k_bits,
+            "v_bits": self.v_bits,
+            "k_compression": f"{k_ratio:.1f}x",
+            "v_compression": f"{v_ratio:.1f}x",
+            "total_bytes": self.nbytes,
+            "fp16_bytes": fp16_bytes,
+            "overall_compression": f"{fp16_bytes / max(self.nbytes, 1):.1f}x",
+        }
 
     @property
     def nbytes_equivalent_fp16(self):

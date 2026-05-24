@@ -146,6 +146,8 @@ class TurboQuantKVCacheV3:
         self._key_centroids_cache = None
         self._value_centroids_cache = None
 
+        self._extra = {}  # arbitrary tensor storage for linear_attn etc.
+
     @property
     def key_sign_bits(self):
         """Returns QJL sign bits sliced to valid offset."""
@@ -387,8 +389,32 @@ class TurboQuantKVCacheV3:
         self.offset -= n
         return n
 
+    def advance(self, n):
+        self.offset += n
+
     def empty(self):
         return self.key_regular_packed is None
+
+    def __getitem__(self, idx):
+        if idx in self._extra:
+            return self._extra[idx]
+        if self.key_regular_packed is None:
+            return None
+        return (self.key_regular_packed[idx], self.value_regular_packed[idx])
+
+    def __setitem__(self, idx, value):
+        self._extra[idx] = value
+
+    def __len__(self):
+        if self.key_regular_packed is None:
+            return 0
+        return len(self.key_regular_packed)
+
+    @property
+    def lengths(self):
+        if self.key_regular_packed is None:
+            return None
+        return mx.array([self.offset])
 
     @property
     def nbytes(self):

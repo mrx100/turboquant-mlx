@@ -286,6 +286,137 @@ MLX-LM's `QuantizedKVCache.nbytes` property crashes with `NameError: name 'tree_
 - [MLX](https://github.com/ml-explore/mlx) — Apple Machine Learning Framework
 - [mlx-lm](https://github.com/ml-explore/mlx-examples/tree/main/llms/mlx_lm) — Language Models for MLX
 
+## Local MLX Model Server
+
+Scripts for serving MLX models from `~/.lmstudio/models/` with TurboQuant KV-cache compression, including OpenAI-compatible API and opencode integration.
+
+### Quickstart
+
+```bash
+# Interactive launcher with TurboQuant compression
+mlx-turboquant.py
+
+# List available models
+mlx-turboquant.py --list
+
+# Start with saved defaults (non-interactive)
+mlx-turboquant.py --serve
+```
+
+### TurboQuant Server (`mlx-turboquant.py`)
+
+Single-file Python launcher with embedded OpenAI-compatible HTTP server.
+
+**Features:**
+- Scans `~/.lmstudio/models/` for MLX models (`.safetensors`)
+- Interactive model/strategy/port selection with saved defaults (`~/.tq_defaults.json`)
+- **Hybrid architecture support**: auto-detects GDN+SDPA models (Qwen 3.5/3.6)
+  - Pure SDPA models: all layers get TurboQuant compression (7 strategies)
+  - Hybrid models: TurboQuant on softmax layers only, GDN layers use pass-through stubs (4 strategies)
+- Streaming (`/v1/chat/completions` with `stream: true`) and non-streaming modes
+- Auto-detects `head_dim` for MoE models (Qwen3.x linear attention)
+- Strips Qwen-style `<think>` blocks from output
+- Patches mlx-lm model modules directly (fixes import aliasing bug in 0.31+)
+
+**API Endpoints:**
+```
+GET  /health                          — Server status + architecture info
+GET  /v1/models                       — Available models
+POST /v1/chat/completions             — Chat completions (streaming + non-streaming)
+```
+
+**Health response for hybrid models:**
+```json
+{
+  "status": "ok",
+  "model": "Qwen3.6-35B-A3B-UD-MLX-4bit",
+  "strategy": "tq_4bit",
+  "architecture": "Hybrid GDN+SDPA",
+  "is_hybrid": true,
+  "softmax_layers": 10,
+  "gdn_layers": 30,
+  "head_dim": 256
+}
+```
+
+**Saved defaults** (`~/.tq_defaults.json`):
+```json
+{
+  "model": "~/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit",
+  "port": 8084,
+  "host": "0.0.0.0",
+  "max_tokens": 2048,
+  "temperature": 0.2,
+  "tq_strategy": "tq_4bit",
+  "ctx_size": 262144,
+  "kv_bits": 4,
+  "kv_group_size": 64,
+  "use_rotation": true,
+  "use_normalization": true
+}
+```
+
+### Hybrid Architecture Support
+
+Qwen 3.5/3.6 use a **3:1 hybrid pattern**: 3 Gated DeltaNet (linear attention) layers followed by 1 standard softmax attention layer, repeating. Out of 40 layers, 30 are GDN and 10 are softmax.
+
+The server builds a **mixed cache list**:
+- **Softmax layers** (indices 3, 7, 11, ...): `TurboQuantKVCacheV2` with 4-bit + QR rotation
+- **GDN layers**: `GDNPassThroughCache` — zero-memory stub that stores conv state and recurrent state
+
+The existing `turboquant.patch` auto-routes: `isinstance(cache, TurboQuantKVCacheV2)` → TurboQuant SDPA, otherwise → standard attention.
+
+**Memory savings** (Qwen 35B, from tqstack benchmarks):
+
+| Context | Standard KV Cache | TurboQuant Hybrid | Saved |
+|---|---|---|---|
+| 8K tokens | ~80 MB | ~23 MB | 57 MB |
+| 32K tokens | ~320 MB | ~91 MB | 229 MB |
+| 128K tokens | ~1.28 GB | ~366 MB | ~914 MB |
+| 262K tokens | ~2.62 GB | ~749 MB | ~1.87 GB |
+
+The GDN layers' recurrent state is fixed-size and doesn't grow with context, so the savings come entirely from the 10 softmax layers. Real benefit kicks in at long contexts (32k+ tokens).
+
+### Model Compatibility
+
+| Model Type | Architecture | TurboQuant Strategies | Notes |
+|---|---|---|---|
+| Standard attention (Llama, Mistral, Gemma) | Pure SDPA | All 7 strategies | Full KV-cache quantization on all layers |
+| Hybrid (Qwen 3.5, Qwen 3.6) | GDN+SDPA (3:1) | 4 hybrid strategies | TurboQuant on 10 softmax layers, GDN layers pass-through |
+
+**Hybrid strategies:**
+- `tq_4bit` — 4-bit + QR rotation + norm baking (Recommended)
+- `tq_4bit_fast` — 4-bit LEAN, no rotation (fastest)
+- `tq_3bit` — 3-bit + rotation + QJL correction
+- `none` — Standard mlx-lm KV cache, no TurboQuant
+
+### Standard MLX Server (`mlx-server.sh`)
+
+Bash launcher using `vmlx-engine serve` for models that don't need TurboQuant compression.
+
+```bash
+mlx-server.sh          # Interactive launcher
+mlx-server.sh --list   # List MLX models
+mlx-server.sh --serve  # Start with saved defaults
+```
+
+### opencode Integration (`opencode-mlx-turboquant.sh`)
+
+Auto-detects running TurboQuant server, updates opencode config, and launches opencode.
+
+```bash
+opencode-mlx-turboquant.sh
+```
+
+**What it does:**
+1. Auto-detects port from `~/.tq_defaults.json` or scans running servers
+2. Fetches model info from `/health` and `/v1/models` endpoints
+3. Updates `~/.config/opencode/opencode.jsonc` dynamically with correct baseURL
+4. Cleans up stale DCP config keys
+5. Launches opencode with the TurboQuant provider as default
+
+
+
 ## License
 
 MIT
