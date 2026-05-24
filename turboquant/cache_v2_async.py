@@ -54,7 +54,7 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
         
         # Try to enable async
         try:
-            self._quant_stream = mx.new_stream()
+            self._quant_stream = mx.new_stream(mx.gpu)
             self._async_enabled = True
         except Exception:
             self._async_enabled = False
