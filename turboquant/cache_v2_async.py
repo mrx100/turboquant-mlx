@@ -42,6 +42,12 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
         
         # Async state
         self._async_enabled = True  # Always enabled, uses mx.async_eval
+        self._async_keys = None
+        self._async_values = None
+        self._async_k_norms = None
+        self._async_v_norms = None
+        self._async_k_sign_bits = None
+        self._async_k_residual_norms = None
         self._pending_keys = None
         self._pending_values = None
         self._pending_k_normalized = None
@@ -81,7 +87,8 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
         
         # Wait for previous async quantization to complete
         if self._quant_in_progress:
-            mx.eval(self._pending_keys)  # Ensure previous pending data is evaluated
+            if self._pending_keys is not None:
+                mx.eval(self._pending_keys)
             self._commit_async_quantization()
         
         # Store pending FP16 data
@@ -209,6 +216,11 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
         if not self._quant_in_progress:
             return
         
+        # Safety: ensure async data exists before eval
+        if self._async_keys is None or self._async_values is None:
+            self._quant_in_progress = False
+            return
+        
         # Evaluate pending data to ensure async ops are complete
         mx.eval(self._async_keys[0], self._async_values[0])
         self._quant_in_progress = False
@@ -232,8 +244,11 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
             self.keys[i][..., prev:self.offset, :] = self._async_keys[i]
             self.values[i][..., prev:self.offset, :] = self._async_values[i]
         
-        self.key_norms[:, :, prev:self.offset] = self._async_k_norms.squeeze(-1)
-        self.value_norms[:, :, prev:self.offset] = self._async_v_norms.squeeze(-1)
+        # Fix: Handle case where async norms might be None (e.g., speculative decoding re-runs)
+        if self._async_k_norms is not None:
+            self.key_norms[:, :, prev:self.offset] = self._async_k_norms.squeeze(-1)
+        if self._async_v_norms is not None:
+            self.value_norms[:, :, prev:self.offset] = self._async_v_norms.squeeze(-1)
         
         if self.use_qjl and self._async_k_sign_bits is not None:
             self.key_sign_bits[:, :, prev:self.offset, :] = self._async_k_sign_bits
@@ -266,7 +281,7 @@ class AsyncTurboQuantKVCacheV2(TurboQuantKVCacheV2):
     
     def flush(self):
         """Force completion of any pending async quantization."""
-        if self._quant_in_progress:
+        if self._quant_in_progress and self._async_keys is not None:
             mx.eval(self._async_keys[0], self._async_values[0])
             self._commit_async_quantization()
     
