@@ -49,7 +49,7 @@ def turboquant_v2_sdpa(
     # Scores via native quantized_matmul
     scores = mx.quantized_matmul(
         q_rot, *q_keys,
-        transpose=True, group_size=cache.group_size, bits=cache.bits,
+        transpose=True, group_size=cache.group_size, bits=getattr(cache, 'k_bits', cache.bits),
     )
 
     # QJL correction (optional)
@@ -86,7 +86,7 @@ def turboquant_v2_sdpa(
     weights = mx.softmax(scores, axis=-1, precise=True)
     output = mx.quantized_matmul(
         weights, *q_values,
-        transpose=False, group_size=cache.group_size, bits=cache.bits,
+        transpose=False, group_size=cache.group_size, bits=getattr(cache, 'v_bits', cache.bits),
     )
 
     # Inverse rotation (optional)

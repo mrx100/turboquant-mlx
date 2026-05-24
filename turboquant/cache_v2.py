@@ -60,6 +60,9 @@ class TurboQuantKVCacheV2:
         self.v_bits = v_bits if v_bits is not None else bits
         self._el_per_int = 32 // self.k_bits  # for reference only
 
+        # Backward compatibility: 'bits' property returns k_bits for old code
+        self.bits = self.k_bits
+
         if use_rotation:
             self.rotation_matrix = generate_rotation_matrix(head_dim, seed=seed)
             mx.eval(self.rotation_matrix)
