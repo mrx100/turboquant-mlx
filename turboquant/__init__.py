@@ -1,3 +1,6 @@
 from turboquant.codebook import get_codebook
 from turboquant.rotation import generate_rotation_matrix, generate_jl_matrix
 from turboquant.cache import TurboQuantKVCache
+from turboquant.cache_v2 import TurboQuantKVCacheV2
+from turboquant.cache_v2_async import AsyncTurboQuantKVCacheV2
+from turboquant.cache_v3 import TurboQuantKVCacheV3
